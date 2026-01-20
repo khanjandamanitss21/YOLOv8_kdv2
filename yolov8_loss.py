@@ -1,0 +1,344 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class TaskAlignedAssigner:
+    """Task Aligned Assigner for YOLOv8"""
+    def __init__(self, topk=10, alpha=0.5, beta=6.0):
+        self.topk = topk
+        self.alpha = alpha
+        self.beta = beta
+
+    @torch.no_grad()
+    def forward(self, pd_scores, pd_bboxes, anchors, gt_labels, gt_bboxes, mask_gt):
+        """
+        Assign ground truth to anchors.
+        
+        Args:
+            pd_scores: [B, A, C] predicted class scores
+            pd_bboxes: [B, A, 4] predicted boxes
+            anchors: [A, 2] anchor points
+            gt_labels: [B, G] ground truth labels
+            gt_bboxes: [B, G, 4] ground truth boxes
+            mask_gt: [B, G] valid gt mask
+        
+        Returns:
+            target_labels: [B, A] assigned class labels
+            target_bboxes: [B, A, 4] assigned boxes
+            target_scores: [B, A, C] assigned scores
+            fg_mask: [B, A] foreground mask
+        """
+        B, A, C = pd_scores.shape
+        G = gt_bboxes.shape[1]
+        device = pd_scores.device
+
+        # Early return if no ground truth
+        if G == 0 or not mask_gt.any():
+            return (
+                torch.zeros((B, A), dtype=torch.long, device=device),
+                torch.zeros((B, A, 4), device=device),
+                torch.zeros((B, A, C), device=device),
+                torch.zeros((B, A), dtype=torch.bool, device=device),
+            )
+
+        # Compute IoU [B, G, A]
+        iou = self.iou(gt_bboxes, pd_bboxes)
+        
+        # Get classification scores - use max across classes
+        cls_score = pd_scores.max(dim=-1)[0]  # [B, A]
+        cls_score = cls_score.unsqueeze(1).expand(-1, G, -1)  # [B, G, A]
+        cls_score = cls_score * mask_gt.unsqueeze(-1).float()
+        
+        # Compute alignment metric
+        align_metric = (cls_score ** self.alpha) * (iou ** self.beta)
+        align_metric = align_metric * mask_gt.unsqueeze(-1).float()
+
+        # Select top-k anchors
+        topk = min(self.topk, A)
+        topk_values, topk_idx = align_metric.topk(topk, dim=-1)
+
+        # Create positive mask
+        mask_pos = torch.zeros((B, G, A), dtype=torch.bool, device=device)
+        valid_mask = (mask_gt.unsqueeze(-1) & (topk_values > 0))
+        
+        for k in range(topk):
+            idx = topk_idx[:, :, k].unsqueeze(-1)
+            mask_pos.scatter_(2, idx, valid_mask[:, :, k:k+1])
+
+        # Foreground mask
+        fg_mask = mask_pos.sum(1) > 0  # [B, A]
+        
+        if not fg_mask.any():
+            return (
+                torch.zeros((B, A), dtype=torch.long, device=device),
+                torch.zeros((B, A, 4), device=device),
+                torch.zeros((B, A, C), device=device),
+                torch.zeros((B, A), dtype=torch.bool, device=device),
+            )
+        
+        # Match GTs to anchors
+        masked_iou = iou * mask_pos.float()
+        matched_gt = masked_iou.argmax(1)  # [B, A]
+
+        # Gather targets
+        target_labels = gt_labels.gather(1, matched_gt)
+        target_labels = target_labels.clamp(0, C - 1)
+        target_labels[~fg_mask] = 0
+        
+        gt_idx_expanded = matched_gt.unsqueeze(-1).expand(-1, -1, 4)
+        target_bboxes = gt_bboxes.gather(1, gt_idx_expanded)
+
+        # Create target scores with IoU quality
+        target_scores = torch.zeros((B, A, C), device=device)
+        iou_scores = masked_iou.gather(1, matched_gt.unsqueeze(1)).squeeze(1)
+        target_scores.scatter_(2, target_labels.unsqueeze(-1), iou_scores.unsqueeze(-1))
+        target_scores *= fg_mask.unsqueeze(-1).float()
+
+        return target_labels, target_bboxes, target_scores, fg_mask
+
+    @staticmethod
+    def iou(box1, box2, eps=1e-7):
+        """Calculate IoU between boxes."""
+        b1 = box1.unsqueeze(2)  # [B, G, 1, 4]
+        b2 = box2.unsqueeze(1)  # [B, 1, A, 4]
+
+        inter = (torch.min(b1[..., 2:], b2[..., 2:]) -
+                 torch.max(b1[..., :2], b2[..., :2])).clamp(0).prod(-1)
+
+        area1 = (b1[..., 2:] - b1[..., :2]).prod(-1)
+        area2 = (b2[..., 2:] - b2[..., :2]).prod(-1)
+
+        return inter / (area1 + area2 - inter + eps)
+
+
+class BboxLoss(nn.Module):
+    """Bounding Box + DFL Loss"""
+    def __init__(self, reg_max=16):
+        super().__init__()
+        self.reg_max = reg_max
+
+    def forward(self, pred_dist, pred_boxes, anchors, target_boxes, target_scores, score_sum, fg_mask):
+        if not fg_mask.any():
+            device = pred_dist.device
+            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+        
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+
+        # CIoU loss
+        iou = self.ciou(pred_boxes[fg_mask], target_boxes[fg_mask])
+        loss_box = ((1.0 - iou) * weight).sum() / score_sum
+
+        # DFL loss
+        target_ltrb = self.box2dist(anchors, target_boxes)
+        target_ltrb = target_ltrb.clamp(0, self.reg_max - 1.0)
+
+        pred_d = pred_dist[fg_mask].view(-1, 4, self.reg_max)
+        target_d = target_ltrb[fg_mask]
+        
+        target_left = target_d.floor().long().clamp(0, self.reg_max - 1)
+        target_right = (target_left + 1).clamp(0, self.reg_max - 1)
+        weight_right = (target_d - target_left.float()).clamp(0, 1)
+        weight_left = 1.0 - weight_right
+        
+        loss_dfl = 0.0
+        for i in range(4):
+            pred_i = pred_d[:, i, :]
+            loss_left = F.cross_entropy(pred_i, target_left[:, i], reduction='none')
+            loss_right = F.cross_entropy(pred_i, target_right[:, i], reduction='none')
+            loss_dfl += (loss_left * weight_left[:, i] + loss_right * weight_right[:, i])
+        
+        loss_dfl = (loss_dfl.unsqueeze(-1) * weight).sum() / (score_sum * 4.0)
+
+        return loss_box, loss_dfl
+
+    @staticmethod
+    def ciou(b1, b2, eps=1e-7):
+        """Complete IoU loss"""
+        inter = (torch.min(b1[:, 2:], b2[:, 2:]) -
+                 torch.max(b1[:, :2], b2[:, :2])).clamp(0).prod(-1)
+        
+        area1 = (b1[:, 2:] - b1[:, :2]).prod(-1)
+        area2 = (b2[:, 2:] - b2[:, :2]).prod(-1)
+        union = area1 + area2 - inter + eps
+        iou = inter / union
+        
+        cw = torch.max(b1[:, 2], b2[:, 2]) - torch.min(b1[:, 0], b2[:, 0])
+        ch = torch.max(b1[:, 3], b2[:, 3]) - torch.min(b1[:, 1], b2[:, 1])
+        c2 = cw ** 2 + ch ** 2 + eps
+        
+        b1_center = (b1[:, :2] + b1[:, 2:]) / 2
+        b2_center = (b2[:, :2] + b2[:, 2:]) / 2
+        rho2 = ((b1_center - b2_center) ** 2).sum(-1)
+        
+        w1 = (b1[:, 2] - b1[:, 0]).clamp(min=eps)
+        h1 = (b1[:, 3] - b1[:, 1]).clamp(min=eps)
+        w2 = (b2[:, 2] - b2[:, 0]).clamp(min=eps)
+        h2 = (b2[:, 3] - b2[:, 1]).clamp(min=eps)
+        
+        v = (4 / (torch.pi ** 2)) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
+        
+        with torch.no_grad():
+            alpha = v / ((1 - iou) + v + eps)
+        
+        ciou = iou - (rho2 / c2 + v * alpha)
+        return ciou.clamp(min=-1.0, max=1.0)
+
+    def box2dist(self, anchors, boxes):
+        """Convert boxes to distance format"""
+        anchors = anchors.unsqueeze(0)
+        lt = boxes[..., :2] - anchors
+        rb = boxes[..., 2:] - anchors
+        return torch.cat([lt, rb], -1).clamp(0, self.reg_max - 0.01)
+
+
+class YOLOv8Loss(nn.Module):
+    """Complete YOLOv8 Loss Function"""
+    def __init__(self, model, nc=80, reg_max=16):
+        super().__init__()
+        self.nc = nc
+        self.reg_max = reg_max
+        
+        # Loss weights
+        self.box_weight = 7.5
+        self.cls_weight = 0.5
+        self.dfl_weight = 1.5
+
+        self.assigner = TaskAlignedAssigner(topk=10, alpha=0.5, beta=6.0)
+        self.bbox_loss = BboxLoss(reg_max)
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+        device = next(model.parameters()).device
+        self.anchors, self.strides = self.make_anchors(device)
+
+    def make_anchors(self, device):
+        """Generate anchor points"""
+        anchors = []
+        strides = []
+        
+        for stride, size in zip([8, 16, 32], [80, 40, 20]):
+            y, x = torch.meshgrid(
+                torch.arange(size, device=device),
+                torch.arange(size, device=device),
+                indexing="ij"
+            )
+            xy = torch.stack([x, y], -1).view(-1, 2).float()
+            xy = (xy + 0.5) * stride
+            anchors.append(xy)
+            strides.extend([stride] * (size * size))
+        
+        anchors = torch.cat(anchors)
+        strides = torch.tensor(strides, device=device)
+        return anchors, strides
+
+    def decode(self, pred_dist):
+        """Decode distance predictions to boxes"""
+        B, A, _ = pred_dist.shape
+        device = pred_dist.device
+        
+        pred = pred_dist.view(B, A, 4, self.reg_max)
+        prob = pred.softmax(-1)
+        
+        proj = torch.arange(self.reg_max, device=device, dtype=pred.dtype)
+        dist = (prob * proj.view(1, 1, 1, -1)).sum(-1)
+        
+        anchors = self.anchors.unsqueeze(0)
+        strides = self.strides.unsqueeze(0).unsqueeze(-1)
+        
+        dist_scaled = dist * strides
+        lt = anchors - dist_scaled[..., :2]
+        rb = anchors + dist_scaled[..., 2:]
+        
+        return torch.cat([lt, rb], -1)
+
+    def forward(self, preds, targets):
+        """
+        Calculate loss.
+        
+        Args:
+            preds: list of 3 tensors from model
+            targets: [N, 6] where each row is [batch_idx, class, x, y, w, h]
+        """
+        cls_out, reg_out = [], []
+
+        for p in preds:
+            d, c = p.split((self.reg_max * 4, self.nc), 1)
+            cls_out.append(c.flatten(2).permute(0, 2, 1))
+            reg_out.append(d.flatten(2).permute(0, 2, 1))
+
+        pred_scores = torch.cat(cls_out, 1)
+        pred_dist = torch.cat(reg_out, 1)
+        pred_boxes = self.decode(pred_dist)
+
+        B = pred_scores.shape[0]
+        
+        gt_labels, gt_boxes, mask_gt = self.build_targets(targets, B)
+
+        t_labels, t_boxes, t_scores, fg_mask = self.assigner.forward(
+            pred_scores.sigmoid().detach(), 
+            pred_boxes.detach(), 
+            self.anchors,
+            gt_labels, 
+            gt_boxes, 
+            mask_gt
+        )
+
+        score_sum = max(t_scores.sum().item(), 1.0)
+        
+        loss_cls = self.bce(pred_scores, t_scores).sum() / score_sum
+        loss_box, loss_dfl = self.bbox_loss(
+            pred_dist, pred_boxes, self.anchors,
+            t_boxes, t_scores, score_sum, fg_mask
+        )
+
+        loss_box = loss_box * self.box_weight
+        loss_cls = loss_cls * self.cls_weight
+        loss_dfl = loss_dfl * self.dfl_weight
+
+        return {
+            "box": loss_box,
+            "cls": loss_cls,
+            "dfl": loss_dfl,
+            "total": loss_box + loss_cls + loss_dfl
+        }
+
+    def build_targets(self, targets, B):
+        """Build ground truth targets"""
+        device = targets.device
+        
+        max_gt = 0
+        for i in range(B):
+            n = (targets[:, 0] == i).sum().item()
+            max_gt = max(max_gt, n)
+        
+        if max_gt == 0:
+            max_gt = 1
+        
+        labels = torch.full((B, max_gt), -1, dtype=torch.long, device=device)
+        boxes = torch.zeros((B, max_gt, 4), device=device)
+        mask = torch.zeros((B, max_gt), dtype=torch.bool, device=device)
+
+        img_size = 640
+        
+        for i in range(B):
+            t = targets[targets[:, 0] == i]
+            if len(t) == 0:
+                continue
+
+            n = len(t)
+            labels[i, :n] = t[:, 1].long()
+            
+            xywh = t[:, 2:6] * img_size
+            x_center = xywh[:, 0]
+            y_center = xywh[:, 1]
+            w = xywh[:, 2]
+            h = xywh[:, 3]
+            
+            boxes[i, :n, 0] = x_center - w / 2
+            boxes[i, :n, 1] = y_center - h / 2
+            boxes[i, :n, 2] = x_center + w / 2
+            boxes[i, :n, 3] = y_center + h / 2
+            
+            mask[i, :n] = True
+
+        return labels, boxes, mask
