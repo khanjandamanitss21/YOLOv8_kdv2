@@ -223,6 +223,10 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch,
                 loss_dict = criterion(preds, targets)
                 loss = loss_dict['total']
             
+            # CRITICAL FIX: Extract loss values OUTSIDE autocast context
+            # and detach from computation graph to prevent memory issues
+            loss_values = {k: v.detach().float().item() for k, v in loss_dict.items()}
+            
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -233,6 +237,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch,
             loss_dict = criterion(preds, targets)
             loss = loss_dict['total']
             
+            # Detach and extract values
+            loss_values = {k: v.detach().item() for k, v in loss_dict.items()}
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
@@ -240,8 +247,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch,
         if ema is not None:
             ema.update(model)
         
+        # Log the extracted values (not the tensors!)
         for k in losses:
-            losses[k].append(loss_dict[k].item())
+            losses[k].append(loss_values[k])
         
         avg_window = min(50, len(losses['total']))
         pbar.set_postfix({
@@ -271,8 +279,9 @@ def validate(model, loader, criterion, device):
         preds = model(imgs)
         loss_dict = criterion(preds, targets)
         
+        # CRITICAL FIX: Detach before extracting values
         for k in losses:
-            losses[k].append(loss_dict[k].item())
+            losses[k].append(loss_dict[k].detach().item())
         
         pbar.set_postfix({
             'box': f"{np.mean(losses['box']):.3f}",
