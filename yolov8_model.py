@@ -146,7 +146,7 @@ class YOLOv8(nn.Module):
         c2 = s.c(128)  # 96
         c3 = s.c(256)  # 192
         c4 = s.c(512)  # 384
-        c5 = s.c(512)  # 384 (changed from 1024)
+        c5 = s.c(1024)  # 768 
 
         # Output channels (what we want)
         out_c3 = 256  # P3 output
