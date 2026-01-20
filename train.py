@@ -1,5 +1,5 @@
 """
-Complete YOLOv8 Training Script
+Complete YOLOv8 Training Script - FIXED
 Production-ready implementation with all optimizations
 
 Usage:
@@ -249,6 +249,9 @@ def main():
     print(f"  Gradient Clipping: {train_config['grad_clip']}")
     print(f"  Validation Interval: {train_config['val_interval']} epoch(s)")
     print("="*80 + "\n")
+    
+    # CRITICAL FIX: Ensure model is in training mode before starting
+    model.train()
     
     try:
         train_yolov8(
